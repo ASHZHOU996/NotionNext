@@ -1,8 +1,9 @@
-const { THEME } = require('./blog.config')
-const fs = require('fs')
-const path = require('path')
+const fs = require('node:fs')
+const path = require('node:path')
 const BLOG = require('./blog.config')
 const { extractLangPrefix } = require('./lib/utils/pageId')
+const { isExport } = require('./lib/utils/buildMode')
+const { getStaticPageGenerationTimeoutSec } = require('./lib/build/buildEnv')
 
 // 打包时是否分析代码
 const withBundleAnalyzer = require('@next/bundle-analyzer')({
@@ -18,8 +19,7 @@ const locales = (function () {
   const langs = [BLOG.LANG]
   if (BLOG.NOTION_PAGE_ID.indexOf(',') > 0) {
     const siteIds = BLOG.NOTION_PAGE_ID.split(',')
-    for (let index = 0; index < siteIds.length; index++) {
-      const siteId = siteIds[index]
+    for (const siteId of siteIds) {
       const prefix = extractLangPrefix(siteId)
       // 如果包含前缀 例如 zh , en 等
       if (prefix) {
@@ -32,16 +32,51 @@ const locales = (function () {
   return langs
 })()
 
+// next dev 时配置可能被多个 worker 各自加载一次，globalThis 无法跨进程去重；用独占文件锁只打印一行。
+;(function printDevCacheHint() {
+  if (process.env.npm_lifecycle_event !== 'dev') return
+  const lockFile = path.join(__dirname, '.next', 'dev-cache-hint.lock')
+  const siblingWindowMs = 15_000 // 同一次 dev 内多 worker；间隔超过则视为新会话，删掉旧锁再提示
+  try {
+    fs.mkdirSync(path.dirname(lockFile), { recursive: true })
+    if (fs.existsSync(lockFile)) {
+      const age = Date.now() - fs.statSync(lockFile).mtimeMs
+      if (age < siblingWindowMs) {
+        return
+      }
+      try {
+        fs.unlinkSync(lockFile)
+      } catch (err) {
+        if (err && err.code !== 'ENOENT') return
+      }
+    }
+  } catch (_) {
+    return
+  }
+  try {
+    fs.closeSync(fs.openSync(lockFile, 'wx'))
+  } catch (e) {
+    if (e && e.code === 'EEXIST') return
+    return
+  }
+  console.log(
+    '[NotionNext] Dev cache ON (ENABLE_CACHE=true); live Notion data → ENABLE_CACHE=false in .env.local'
+  )
+})()
+
 // 编译前执行
 // eslint-disable-next-line no-unused-vars
 const preBuild = (function () {
   if (
-    !process.env.npm_lifecycle_event === 'export' &&
-    !process.env.npm_lifecycle_event === 'build'
+    process.env.npm_lifecycle_event !== 'export' &&
+    process.env.npm_lifecycle_event !== 'build'
   ) {
     return
   }
   // 删除 public/sitemap.xml 文件 ； 否则会和/pages/sitemap.xml.js 冲突。
+  if (process.env.NEXT_PRIVATE_BUILD_WORKER) {
+    return
+  }
   const sitemapPath = path.resolve(__dirname, 'public', 'sitemap.xml')
   if (fs.existsSync(sitemapPath)) {
     fs.unlinkSync(sitemapPath)
@@ -53,6 +88,38 @@ const preBuild = (function () {
     fs.unlinkSync(sitemap2Path)
     console.log('Deleted existing sitemap.xml from root directory')
   }
+
+  // 构建前删除遗留的静态 RSS 产物，避免与生成逻辑不一致时读到过时 feed（源自 PR #3123 的单一补丁）
+  const rssDir = path.resolve(__dirname, 'public', 'rss')
+  for (const name of ['feed.xml', 'atom.xml', 'feed.json']) {
+    const rssPath = path.join(rssDir, name)
+    if (fs.existsSync(rssPath)) {
+      fs.unlinkSync(rssPath)
+      console.log(`Deleted existing ${name} from public/rss`)
+    }
+  }
+
+  const notionCacheRoot = path.resolve(__dirname, '.next', 'cache', 'notion')
+  const prefetchDir = path.join(notionCacheRoot, 'sessions')
+  const sessionFile = path.join(notionCacheRoot, 'build-session.json')
+  const sessionId = `${process.env.npm_lifecycle_event}-${Date.now()}-${process.pid}`
+
+  fs.rmSync(prefetchDir, { recursive: true, force: true })
+  fs.mkdirSync(notionCacheRoot, { recursive: true })
+  fs.writeFileSync(
+    sessionFile,
+    JSON.stringify(
+      {
+        sessionId,
+        createdAt: new Date().toISOString(),
+        lifecycle: process.env.npm_lifecycle_event,
+        pid: process.pid
+      },
+      null,
+      2
+    )
+  )
+  console.log('Prepared Notion build session', sessionId)
 })()
 
 /**
@@ -81,7 +148,7 @@ function scanSubdirectories(directory) {
  */
 
 function getOutput() {
-  if (process.env.EXPORT) return 'export'
+  if (isExport()) return 'export'
   if (process.env.NEXT_BUILD_STANDALONE === 'true') return 'standalone'
   return undefined
 }
@@ -91,7 +158,7 @@ const nextConfig = {
     ignoreDuringBuilds: true
   },
   output: getOutput(),
-  staticPageGenerationTimeout: 300,
+  staticPageGenerationTimeout: getStaticPageGenerationTimeoutSec(),
 
   // 性能优化配置
   compress: true,
@@ -122,16 +189,17 @@ const nextConfig = {
     // 图片尺寸优化
     deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840],
     imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
-    // 允许next/image加载的图片 域名
-    domains: [
-      'gravatar.com',
-      'www.notion.so',
-      'avatars.githubusercontent.com',
-      'images.unsplash.com',
-      'source.unsplash.com',
-      'p1.qhimg.com',
-      'webmention.io',
-      'ko-fi.com'
+    // NotionNext 站长图源不可控（任意外链），这里放开 http/https 远程图片来源
+    // 说明：这会显著降低“域名白名单漏配导致图片不显示”的概率
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: '**'
+      },
+      {
+        protocol: 'http',
+        hostname: '**'
+      }
     ],
     // 图片加载器优化
     loader: 'default',
@@ -163,8 +231,7 @@ const nextConfig = {
       if (BLOG.NOTION_PAGE_ID.indexOf(',') > 0) {
         const siteIds = BLOG.NOTION_PAGE_ID.split(',')
         const langs = []
-        for (let index = 0; index < siteIds.length; index++) {
-          const siteId = siteIds[index]
+        for (const siteId of siteIds) {
           const prefix = extractLangPrefix(siteId)
           // 如果包含前缀 例如 zh , en 等
           if (prefix) {
@@ -276,53 +343,31 @@ const nextConfig = {
   webpack: (config, { dev, isServer }) => {
     // 动态主题：添加 resolve.alias 配置，将动态路径映射到实际路径
     config.resolve.alias['@'] = path.resolve(__dirname)
-
-    if (!isServer) {
-      console.log('[默认主题]', path.resolve(__dirname, 'themes', THEME))
-    }
-    config.resolve.alias['@theme-components'] = path.resolve(
+    config.resolve.alias['lodash.throttle'] = path.resolve(
       __dirname,
-      'themes',
-      THEME
+      'lib/utils/throttle.js'
     )
 
-    // 性能优化配置
-    if (!dev) {
-      // 生产环境优化
-      config.optimization = {
-        ...config.optimization,
-        splitChunks: {
-          chunks: 'all',
-          cacheGroups: {
-            vendor: {
-              test: /[\\/]node_modules[\\/]/,
-              name: 'vendors',
-              chunks: 'all',
-            },
-            common: {
-              name: 'common',
-              minChunks: 2,
-              chunks: 'all',
-              enforce: true,
-            },
-          },
-        },
+    if (!isServer) {
+      console.log(
+        '[ThemeResolver][webpack]',
+        JSON.stringify({
+          note:
+            'Layouts load via dynamic import(@/themes/<name>). Theme folder follows runtime NEXT_PUBLIC_THEME / Notion; no compile-time @theme-components alias.',
+          envTheme: process.env.NEXT_PUBLIC_THEME || null,
+          configTheme: BLOG.THEME,
+          themeFolderPath: path.resolve(__dirname, 'themes', BLOG.THEME)
+        })
+      )
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        fs: false,
+        net: false,
+        tls: false,
+        dns: false,
+        path: false
       }
     }
-
-    // Enable source maps in development mode
-    if (dev || process.env.NODE_ENV_API === 'development') {
-      // config.devtool = 'source-map'
-      config.devtool = 'eval-source-map'
-      // console.log('启动调试 nextjs.config.devtool ', config.devtool)
-    }
-
-    // 优化模块解析
-    config.resolve.modules = [
-      path.resolve(__dirname, 'node_modules'),
-      'node_modules'
-    ]
-
     return config
   }
   ,
